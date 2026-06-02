@@ -207,14 +207,103 @@ class CTBRDroneRLAdapter:
         )
         self.state.prev_action = np.zeros(4, dtype=np.float32)
 
+    # def apply_policy_action(self, action: Sequence[float]) -> Tuple[float, float, float, float]:
+    #     roll, pitch, yaw, thrust = map_policy_action_to_ctbr(action, self.action_limits)
+    #     self.controller.update_ctbr_send_params(
+    #         body_roll_rate=roll,
+    #         body_pitch_rate=pitch,
+    #         body_yaw_rate=yaw,
+    #         thrust=thrust,
+    #     )
+    #     self.state.prev_action = np.array([roll, pitch, yaw, thrust], dtype=np.float32)
+    #     return roll, pitch, yaw, thrust
+
+    # 临时高度维持版本
     def apply_policy_action(self, action: Sequence[float]) -> Tuple[float, float, float, float]:
-        roll, pitch, yaw, thrust = map_policy_action_to_ctbr(action, self.action_limits)
+        pol_roll, pol_pitch, yaw, thrust = map_policy_action_to_ctbr(action, self.action_limits)
+
+        roll = pol_roll
+        pitch = pol_pitch
+
+        if self.state.home is not None:
+            obs = self.get_observation()
+            home = self.state.home
+
+            x_err = float(obs.x) - home.x
+            y_err = float(obs.y) - home.y
+            z_err = float(obs.z) - home.z
+
+            vx = float(obs.vx)
+            vy = float(obs.vy)
+            vz = float(obs.vz)
+
+            # ------------------------------------------------------------
+            # 1) XY 外环：位置/速度误差 -> 期望姿态角
+            # ------------------------------------------------------------
+            kp_pos_xy = 0.032
+            kd_vel_xy = 0.045
+            max_tilt_cmd = 0.11
+
+            # 这组符号沿用你当前的方向假设。
+            # 如果 PD-only 测试发现越修越远，再反符号。
+            pitch_des = clamp(
+                kp_pos_xy * x_err + kd_vel_xy * vx,
+                -max_tilt_cmd,
+                max_tilt_cmd,
+            )
+
+            roll_des = clamp(
+                -kp_pos_xy * y_err - kd_vel_xy * vy,
+                -max_tilt_cmd,
+                max_tilt_cmd,
+            )
+
+            # ------------------------------------------------------------
+            # 2) 姿态内环：期望姿态角 - 当前姿态角 -> body rate
+            # ------------------------------------------------------------
+            kp_att = 0.6
+            max_feedback_rate = 0.045
+
+            pitch_fb = clamp(
+                kp_att * (pitch_des - float(obs.pitch)),
+                -max_feedback_rate,
+                max_feedback_rate,
+            )
+
+            roll_fb = clamp(
+                kp_att * (roll_des - float(obs.roll)),
+                -max_feedback_rate,
+                max_feedback_rate,
+            )
+
+            # ------------------------------------------------------------
+            # 3) 策略只作为小残差，先不要让 MAPPO 直接主导姿态
+            # ------------------------------------------------------------
+            # residual_gain = 0.10
+            residual_gain = 0.05
+
+            pitch = pitch_fb + residual_gain * pol_pitch
+            roll = roll_fb + residual_gain * pol_roll
+
+            # ------------------------------------------------------------
+            # 4) Z 保护
+            # ------------------------------------------------------------
+            kp_z = 0.030
+            kd_z = 0.012
+
+            thrust += kp_z * z_err + kd_z * vz
+
+            roll = clamp(roll, -self.action_limits.max_roll_rate, self.action_limits.max_roll_rate)
+            pitch = clamp(pitch, -self.action_limits.max_pitch_rate, self.action_limits.max_pitch_rate)
+            thrust = clamp(thrust, self.action_limits.thrust_min, self.action_limits.thrust_max)
+
         self.controller.update_ctbr_send_params(
             body_roll_rate=roll,
             body_pitch_rate=pitch,
             body_yaw_rate=yaw,
             thrust=thrust,
         )
+
         self.state.prev_action = np.array([roll, pitch, yaw, thrust], dtype=np.float32)
         return roll, pitch, yaw, thrust
 

@@ -672,8 +672,8 @@ class SimTimeKeeper:
                         timeout=wait_timeout,
                     )
                 except KeyboardInterrupt:
-                    logger.warning("SimTimeKeeper 等待被中断")
-                    return False
+                    logger.warning("SimTimeKeeper 等待被中断，正在退出训练")
+                    raise
 
 
 # ==============================================

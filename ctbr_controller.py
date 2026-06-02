@@ -113,6 +113,8 @@ class CTBRController:
                 use_condition=use_sync_condition,
                 logger=self._logger,
             )
+        
+        self._offboard_confirmed: bool = False
 
     # ----------------------------------------------------------------------
     # MAVLink receive / ACK / state helpers
@@ -158,6 +160,8 @@ class CTBRController:
         self._armed = bool(
             self._base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
         )
+        if not self._armed:
+            self._offboard_confirmed = False
         self._push_runtime_status_to_logger()
 
     def _handle_status_text(self, msg):
@@ -170,6 +174,15 @@ class CTBRController:
             return
 
         self._status_texts.append(text)
+
+        text_lower = text.lower()
+        if any(k in text_lower for k in [
+            "failsafe",
+            "rtl",
+            "offboard lost",
+            "offboard loss",
+        ]):
+            self._offboard_confirmed = False
 
         severity = int(getattr(msg, "severity", 6))
         if severity <= mavutil.mavlink.MAV_SEVERITY_WARNING:
@@ -311,6 +324,28 @@ class CTBRController:
 
     def _recent_status_text(self, n: int = 5) -> List[str]:
         return list(self._status_texts)[-n:]
+    
+    def is_probably_offboard(self) -> bool:
+        """
+        判断当前是否可以认为仍处于 OFFBOARD。
+
+        不直接依赖 _flight_mode_name()，因为 PX4 HEARTBEAT custom_mode
+        不一定简单等于 6。
+        """
+        if not self._armed:
+            return False
+
+        recent_lower = " | ".join(self._recent_status_text(10)).lower()
+
+        if any(k in recent_lower for k in [
+            "failsafe",
+            "rtl",
+            "offboard lost",
+            "offboard loss",
+        ]):
+            return False
+
+        return bool(self._offboard_confirmed)
 
     def _wait_until_armed_state(self, desired_armed: bool, timeout: float = 5.0) -> bool:
         """[MOD] 通过接收线程维护的 HEARTBEAT armed 状态确认解锁/上锁。"""
@@ -688,7 +723,7 @@ class CTBRController:
               模式切换 ACK 通过内部 ACK 队列等待，不再直接 recv_match。
         """
 
-        if mode == 6 and self._armed and self._flight_mode_name() == "OFFBOARD":
+        if mode == 6 and self.is_probably_offboard():
             logger.debug("已经处于 OFFBOARD，跳过重复模式切换")
             return True
 
@@ -776,6 +811,8 @@ class CTBRController:
             logger.error(f"最近 PX4 STATUSTEXT: {self._recent_status_text()}")
 
         if success:
+            if mode == 6:
+                self._offboard_confirmed = True
             self._status_texts.clear()
 
         if success and is_maintain_offboard and mode == 6:
@@ -1076,7 +1113,8 @@ class CTBRController:
 
     def _send_ctbr_control_loop(self):
         """线程内部函数：循环读取 current_params 并发送。"""
-        logger.info(f"发送线程启动，频率: {self.send_frequency}Hz")
+        logger.debug(f"发送线程启动，频率: {self.send_frequency}Hz")
+        # logger.info(f"发送线程启动，频率: {self.send_frequency}Hz")
         while self.is_sending:
             with self.param_lock:
                 roll = self.current_params.body_roll_rate
@@ -1087,7 +1125,8 @@ class CTBRController:
             self.set_ctbr_parameters_send(roll, pitch, yaw, thrust)
             time.sleep(1.0 / self.send_frequency)
 
-        logger.info("发送线程已停止")
+        logger.debug("发送线程已停止")
+        # logger.info("发送线程已停止")
 
     def start_ctbr_send_thread(self, frequency=50):
         """启动 CTBR 发送线程。"""
