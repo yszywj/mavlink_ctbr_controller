@@ -49,24 +49,24 @@ class GoalPoint:
 
 @dataclass
 class CTBRActionLimits:
-    max_roll_rate: float = 0.10
-    max_pitch_rate: float = 0.10
-    max_yaw_rate: float = 0.08
-    hover_thrust: float = 0.585
-    thrust_delta: float = 0.035
-    thrust_min: float = 0.54
-    thrust_max: float = 0.64
+    max_roll_rate: float = 0.04
+    max_pitch_rate: float = 0.04
+    max_yaw_rate: float = 0.03
+    hover_thrust: float = 0.575
+    thrust_delta: float = 0.015
+    thrust_min: float = 0.55
+    thrust_max: float = 0.60
 
 
 @dataclass
 class SafetyLimits:
     min_altitude: float = 0.35
-    max_altitude: float = 12.0
-    max_tilt_deg: float = 70.0
-    max_body_rate: float = 7.0
-    max_down_speed: float = 4.5
-    max_xy_from_home: float = 15.0
-    max_z_error_from_home: float = 8.0
+    max_altitude: float = 11.5
+    max_tilt_deg: float = 60.0
+    max_body_rate: float = 5.0
+    max_down_speed: float = 3.5
+    max_xy_from_home: float = 5.0
+    max_z_error_from_home: float = 4.0
     stale_wall_time_sec: float = 0.75
 
 
