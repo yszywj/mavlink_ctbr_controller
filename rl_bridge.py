@@ -67,7 +67,7 @@ class SafetyLimits:
     max_down_speed: float = 3.5
     max_xy_from_home: float = 5.0
     max_z_error_from_home: float = 4.0
-    stale_wall_time_sec: float = 0.75
+    stale_wall_time_sec: float = 2.0
 
 
 @dataclass
@@ -229,7 +229,11 @@ class CTBRDroneRLAdapter:
         last_update = 0.0
         px4_time = 0
         if self.controller.data_sync:
-            last_update = getattr(self.controller.data_sync, "_last_update_wall_time", 0.0)
+            last_update = getattr(
+                self.controller.data_sync,
+                "_last_any_obs_wall_time",
+                getattr(self.controller.data_sync, "_last_update_wall_time", 0.0),
+            )
             px4_time = self.controller.data_sync.get_latest_px4_time_ms()
 
         is_fresh = (now_wall - last_update) <= self.safety_limits.stale_wall_time_sec
@@ -237,7 +241,15 @@ class CTBRDroneRLAdapter:
         flight_mode = self.controller._flight_mode_name() if hasattr(self.controller, "_flight_mode_name") else ""
         recent_text = " | ".join(self.controller._recent_status_text(10)) if hasattr(self.controller, "_recent_status_text") else ""
         recent_lower = recent_text.lower()
-        failsafe = any(k in recent_lower for k in ["failsafe", "rtl", "battery warning", "land"])
+        failsafe = any(
+            k in recent_lower
+            for k in [
+                "failsafe",
+                "rtl",
+                "offboard lost",
+                "navigation state: rtl",
+            ]
+        )
         return DroneSnapshot(
             obs=obs,
             px4_time_boot_ms=px4_time,

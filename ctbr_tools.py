@@ -341,6 +341,7 @@ class DroneDataSync:
         }
         self._episode_status = EpisodeStatus()
         self._runtime_status = RuntimeStatus()
+        self._last_any_obs_wall_time: float = 0.0
 
     def _extract_msg_time_ms(self, msg) -> int:
         """[MOD] 统一提取 MAVLink 消息时间戳，单位 ms。"""
@@ -373,6 +374,9 @@ class DroneDataSync:
                 self._frame_cache[msg_type] = msg
 
             self._try_emit_synced_frame_locked()
+        
+        if msg_type in ("ATTITUDE", "LOCAL_POSITION_NED"):
+            self._last_any_obs_wall_time = time.time()
 
     def on_new_action(self, action: ActionData):
         """时间戳填充和动作记录"""

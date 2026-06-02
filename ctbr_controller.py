@@ -687,6 +687,11 @@ class CTBRController:
         [MOD] 切 OFFBOARD 前仍然发送 40 帧 setpoint 预热；
               模式切换 ACK 通过内部 ACK 队列等待，不再直接 recv_match。
         """
+
+        if mode == 6 and self._armed and self._flight_mode_name() == "OFFBOARD":
+            logger.debug("已经处于 OFFBOARD，跳过重复模式切换")
+            return True
+
         initial_x, initial_y, initial_z = default_x, default_y, default_z
         use_default = True
 
@@ -769,6 +774,9 @@ class CTBRController:
                     f"{self._result_name(ack.result)} ({ack.result})"
                 )
             logger.error(f"最近 PX4 STATUSTEXT: {self._recent_status_text()}")
+
+        if success:
+            self._status_texts.clear()
 
         if success and is_maintain_offboard and mode == 6:
             self.start_offboard_maintain(default_x, default_y, default_z)
