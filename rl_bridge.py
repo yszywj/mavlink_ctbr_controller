@@ -56,6 +56,7 @@ class CTBRActionLimits:
     thrust_delta: float = 0.015
     thrust_min: float = 0.55
     thrust_max: float = 0.60
+    residual_gain: float = 0.0
 
 
 @dataclass
@@ -220,10 +221,12 @@ class CTBRDroneRLAdapter:
 
     # 临时高度维持版本
     def apply_policy_action(self, action: Sequence[float]) -> Tuple[float, float, float, float]:
-        pol_roll, pol_pitch, yaw, thrust = map_policy_action_to_ctbr(action, self.action_limits)
+        pol_roll, pol_pitch, pol_yaw, pol_thrust = map_policy_action_to_ctbr(action, self.action_limits)
 
         roll = pol_roll
         pitch = pol_pitch
+        yaw = pol_yaw
+        thrust = pol_thrust
 
         if self.state.home is not None:
             obs = self.get_observation()
@@ -238,22 +241,23 @@ class CTBRDroneRLAdapter:
             vz = float(obs.vz)
 
             # ------------------------------------------------------------
-            # 1) XY 外环：位置/速度误差 -> 期望姿态角
+            # 1) XY outer loop: position/velocity error -> desired Euler attitude.
             # ------------------------------------------------------------
-            kp_pos_xy = 0.032
-            kd_vel_xy = 0.045
-            max_tilt_cmd = 0.11
+            kp_pos_xy = 0.025
+            kd_vel_xy = 0.100
+            max_tilt_cmd = 0.16
 
-            # 这组符号沿用你当前的方向假设。
-            # 如果 PD-only 测试发现越修越远，再反符号。
+            # Keep this in Euler roll/pitch space; the yaw-frame variant made
+            # the current PX4 body-rate loop diverge faster. The roll channel
+            # uses the opposite sign to pitch for this simulator/controller pair.
             pitch_des = clamp(
-                kp_pos_xy * x_err + kd_vel_xy * vx,
+                -kp_pos_xy * x_err - kd_vel_xy * vx,
                 -max_tilt_cmd,
                 max_tilt_cmd,
             )
 
             roll_des = clamp(
-                -kp_pos_xy * y_err - kd_vel_xy * vy,
+                kp_pos_xy * y_err + kd_vel_xy * vy,
                 -max_tilt_cmd,
                 max_tilt_cmd,
             )
@@ -261,8 +265,8 @@ class CTBRDroneRLAdapter:
             # ------------------------------------------------------------
             # 2) 姿态内环：期望姿态角 - 当前姿态角 -> body rate
             # ------------------------------------------------------------
-            kp_att = 0.6
-            max_feedback_rate = 0.045
+            kp_att = 1.00
+            max_feedback_rate = 0.080
 
             pitch_fb = clamp(
                 kp_att * (pitch_des - float(obs.pitch)),
@@ -279,11 +283,12 @@ class CTBRDroneRLAdapter:
             # ------------------------------------------------------------
             # 3) 策略只作为小残差，先不要让 MAPPO 直接主导姿态
             # ------------------------------------------------------------
-            # residual_gain = 0.10
-            residual_gain = 0.05
+            residual_gain = self.action_limits.residual_gain
 
             pitch = pitch_fb + residual_gain * pol_pitch
             roll = roll_fb + residual_gain * pol_roll
+            yaw = 0.0
+            thrust = self.action_limits.hover_thrust
 
             # ------------------------------------------------------------
             # 4) Z 保护
