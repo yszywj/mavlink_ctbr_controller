@@ -231,9 +231,10 @@ class CTBRDroneRLAdapter:
         if self.state.home is not None:
             obs = self.get_observation()
             home = self.state.home
+            xy_ref = self.state.goal if self.state.goal is not None else home
 
-            x_err = float(obs.x) - home.x
-            y_err = float(obs.y) - home.y
+            x_err = float(obs.x) - xy_ref.x
+            y_err = float(obs.y) - xy_ref.y
             z_err = float(obs.z) - home.z
 
             vx = float(obs.vx)
@@ -242,21 +243,24 @@ class CTBRDroneRLAdapter:
 
             # ------------------------------------------------------------
             # 1) XY outer loop: position/velocity error -> desired Euler attitude.
+            # XY tracks the current RL goal; Z still tracks home altitude.
+            # Raw CTBR axis probe at the Pegasus hover heading (~pi/2 yaw)
+            # showed:
+            #   +roll_rate  -> world vx decreases, -roll_rate  -> vx increases
+            #   +pitch_rate -> world vy decreases, -pitch_rate -> vy increases
+            # So roll regulates world X and pitch regulates world Y here.
             # ------------------------------------------------------------
             kp_pos_xy = 0.025
             kd_vel_xy = 0.100
             max_tilt_cmd = 0.16
 
-            # Keep this in Euler roll/pitch space; the yaw-frame variant made
-            # the current PX4 body-rate loop diverge faster. The roll channel
-            # uses the opposite sign to pitch for this simulator/controller pair.
-            pitch_des = clamp(
-                -kp_pos_xy * x_err - kd_vel_xy * vx,
+            roll_des = clamp(
+                kp_pos_xy * x_err + kd_vel_xy * vx,
                 -max_tilt_cmd,
                 max_tilt_cmd,
             )
 
-            roll_des = clamp(
+            pitch_des = clamp(
                 kp_pos_xy * y_err + kd_vel_xy * vy,
                 -max_tilt_cmd,
                 max_tilt_cmd,
@@ -266,7 +270,7 @@ class CTBRDroneRLAdapter:
             # 2) 姿态内环：期望姿态角 - 当前姿态角 -> body rate
             # ------------------------------------------------------------
             kp_att = 1.00
-            max_feedback_rate = 0.080
+            max_feedback_rate = min(0.080, self.action_limits.max_roll_rate, self.action_limits.max_pitch_rate)
 
             pitch_fb = clamp(
                 kp_att * (pitch_des - float(obs.pitch)),
