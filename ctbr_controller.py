@@ -1111,10 +1111,29 @@ class CTBRController:
     # CTBR send thread
     # ----------------------------------------------------------------------
 
+    def _sim_time_keeper_or_none(self) -> Optional[SimTimeKeeper]:
+        """Return a SimTimeKeeper when PX4 timestamp data is available."""
+        if not self.data_sync or not getattr(self.data_sync, "_use_condition", False):
+            return None
+        try:
+            return self.get_sim_time_keeper()
+        except RuntimeError:
+            return None
+
     def _send_ctbr_control_loop(self):
-        """线程内部函数：循环读取 current_params 并发送。"""
-        logger.debug(f"发送线程启动，频率: {self.send_frequency}Hz")
-        # logger.info(f"发送线程启动，频率: {self.send_frequency}Hz")
+        """线程内部函数：循环读取 current_params 并发送。
+
+        The requested frequency is interpreted in PX4/simulation time when
+        timestamped MAVLink data is available.  This keeps the setpoint rate
+        stable if Isaac/Pegasus runs slower or faster than wall time.
+        """
+        period_sec = 1.0 / max(float(self.send_frequency), 1e-6)
+        time_keeper = self._sim_time_keeper_or_none()
+        wait_timeout_sec = max(1.0, period_sec * 10.0)
+        time_mode = "simulation" if time_keeper is not None else "wall"
+
+        logger.debug(f"发送线程启动，频率: {self.send_frequency}Hz ({time_mode} time)")
+        # logger.info(f"发送线程启动，频率: {self.send_frequency}Hz ({time_mode} time)")
         while self.is_sending:
             with self.param_lock:
                 roll = self.current_params.body_roll_rate
@@ -1123,7 +1142,19 @@ class CTBRController:
                 thrust = self.current_params.thrust
 
             self.set_ctbr_parameters_send(roll, pitch, yaw, thrust)
-            time.sleep(1.0 / self.send_frequency)
+
+            if time_keeper is not None:
+                ok = time_keeper.wait(period_sec, timeout=wait_timeout_sec)
+                if not ok:
+                    # PX4 may not have started publishing timestamps yet, or
+                    # the sim may be paused.  Re-check once, then avoid spinning.
+                    time_keeper = self._sim_time_keeper_or_none()
+                    if time_keeper is None:
+                        time.sleep(period_sec)
+                    else:
+                        time.sleep(min(period_sec, 0.05))
+            else:
+                time.sleep(period_sec)
 
         logger.debug("发送线程已停止")
         # logger.info("发送线程已停止")

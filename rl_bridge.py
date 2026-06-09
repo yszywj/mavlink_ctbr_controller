@@ -57,6 +57,11 @@ class CTBRActionLimits:
     thrust_min: float = 0.55
     thrust_max: float = 0.60
     residual_gain: float = 0.0
+    # Backward-compatible alias for goal_feedback_scale when the newer field is
+    # not supplied by older scripts.
+    pd_feedback_scale: float = 1.0
+    goal_feedback_scale: Optional[float] = None
+    attitude_feedback_scale: float = 1.0
 
 
 @dataclass
@@ -243,7 +248,9 @@ class CTBRDroneRLAdapter:
 
             # ------------------------------------------------------------
             # 1) XY outer loop: position/velocity error -> desired Euler attitude.
-            # XY tracks the current RL goal; Z still tracks home altitude.
+            # Goal attraction is separate from safety damping.  Setting
+            # goal_feedback_scale=0 disables final-goal pull while keeping
+            # velocity damping and attitude leveling active.
             # Raw CTBR axis probe at the Pegasus hover heading (~pi/2 yaw)
             # showed:
             #   +roll_rate  -> world vx decreases, -roll_rate  -> vx increases
@@ -253,15 +260,18 @@ class CTBRDroneRLAdapter:
             kp_pos_xy = 0.025
             kd_vel_xy = 0.100
             max_tilt_cmd = 0.16
+            goal_feedback_scale = self.action_limits.goal_feedback_scale
+            if goal_feedback_scale is None:
+                goal_feedback_scale = self.action_limits.pd_feedback_scale
 
             roll_des = clamp(
-                kp_pos_xy * x_err + kd_vel_xy * vx,
+                goal_feedback_scale * kp_pos_xy * x_err + kd_vel_xy * vx,
                 -max_tilt_cmd,
                 max_tilt_cmd,
             )
 
             pitch_des = clamp(
-                kp_pos_xy * y_err + kd_vel_xy * vy,
+                goal_feedback_scale * kp_pos_xy * y_err + kd_vel_xy * vy,
                 -max_tilt_cmd,
                 max_tilt_cmd,
             )
@@ -288,9 +298,10 @@ class CTBRDroneRLAdapter:
             # 3) 策略只作为小残差，先不要让 MAPPO 直接主导姿态
             # ------------------------------------------------------------
             residual_gain = self.action_limits.residual_gain
+            attitude_feedback_scale = self.action_limits.attitude_feedback_scale
 
-            pitch = pitch_fb + residual_gain * pol_pitch
-            roll = roll_fb + residual_gain * pol_roll
+            pitch = attitude_feedback_scale * pitch_fb + residual_gain * pol_pitch
+            roll = attitude_feedback_scale * roll_fb + residual_gain * pol_roll
             yaw = 0.0
             thrust = self.action_limits.hover_thrust
 
