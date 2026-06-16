@@ -1021,11 +1021,21 @@ class CTBRController:
             ("COM_OF_LOSS_T", 10.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
             ("COM_OBL_RC_ACT", 0, mavutil.mavlink.MAV_PARAM_TYPE_INT32),
         ]
+        optional_params = [
+            # Disable PX4's own ULog backend in SITL. PX4 marks this parameter
+            # as reboot-required, so it may take effect on the next PX4 start.
+            ("SDLOG_BACKEND", 0, mavutil.mavlink.MAV_PARAM_TYPE_INT32),
+        ]
 
         ok_all = True
         for name, value, param_type in params:
             ok = self.set_px4_param(name, value, param_type=param_type)
             ok_all = ok_all and ok
+
+        for name, value, param_type in optional_params:
+            ok = self.set_px4_param(name, value, param_type=param_type)
+            if not ok:
+                logger.warning(f"可选 PX4 参数设置失败，继续训练: {name}={value}")
 
         return ok_all
     

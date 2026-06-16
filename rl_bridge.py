@@ -62,6 +62,12 @@ class CTBRActionLimits:
     pd_feedback_scale: float = 1.0
     goal_feedback_scale: Optional[float] = None
     attitude_feedback_scale: float = 1.0
+    goal_xy_pos_gain: float = 0.025
+    xy_velocity_damping_gain: float = 0.100
+    xy_max_tilt_cmd: float = 0.16
+    z_feedback_scale: float = 1.0
+    z_pos_gain: float = 0.040
+    z_vel_gain: float = 0.060
 
 
 @dataclass
@@ -145,16 +151,26 @@ def observation_vector(
     own pos(3), own vel(3), own attitude(3), own body rates(3),
     goal relative pos(3), other relative pos(3), other relative vel(3), prev action(4).
     """
-    own_pos = np.array([own.x, own.y, own.z], dtype=np.float32)
-    own_vel = np.array([own.vx, own.vy, own.vz], dtype=np.float32)
-    own_att = np.array([own.roll, own.pitch, own.yaw], dtype=np.float32)
-    own_rates = np.array([own.rollspeed, own.pitchspeed, own.yawspeed], dtype=np.float32)
+    # Fixed physical scaling keeps PPO/MAPPO inputs in a small, stable range
+    # without depending on running statistics from one particular training run.
+    own_pos = np.array([own.x, own.y, own.z], dtype=np.float32) / 10.0
+    own_vel = np.array([own.vx, own.vy, own.vz], dtype=np.float32) / 3.0
+    own_att = np.array([own.roll, own.pitch, own.yaw], dtype=np.float32) / math.pi
+    own_rates = np.array([own.rollspeed, own.pitchspeed, own.yawspeed], dtype=np.float32) / 4.0
 
-    goal_rel = np.array([goal.x - own.x, goal.y - own.y, goal.z - own.z], dtype=np.float32)
-    other_rel_pos = np.array([other.x - own.x, other.y - own.y, other.z - own.z], dtype=np.float32)
-    other_rel_vel = np.array([other.vx - own.vx, other.vy - own.vy, other.vz - own.vz], dtype=np.float32)
+    goal_rel = np.array([goal.x - own.x, goal.y - own.y, goal.z - own.z], dtype=np.float32) / 5.0
+    other_rel_pos = np.array([other.x - own.x, other.y - own.y, other.z - own.z], dtype=np.float32) / 5.0
+    other_rel_vel = np.array([other.vx - own.vx, other.vy - own.vy, other.vz - own.vz], dtype=np.float32) / 3.0
+    prev = prev_action.astype(np.float32).copy()
+    if prev.shape == (4,):
+        prev = np.array([
+            prev[0] / 0.08,
+            prev[1] / 0.08,
+            prev[2] / 0.03,
+            (prev[3] - 0.58) / 0.22,
+        ], dtype=np.float32)
 
-    return np.concatenate([
+    vec = np.concatenate([
         own_pos,
         own_vel,
         own_att,
@@ -162,8 +178,9 @@ def observation_vector(
         goal_rel,
         other_rel_pos,
         other_rel_vel,
-        prev_action.astype(np.float32),
+        prev,
     ]).astype(np.float32)
+    return np.clip(vec, -5.0, 5.0).astype(np.float32)
 
 
 def goal_distance(obs: ObservationData, goal: GoalPoint) -> float:
@@ -237,10 +254,11 @@ class CTBRDroneRLAdapter:
             obs = self.get_observation()
             home = self.state.home
             xy_ref = self.state.goal if self.state.goal is not None else home
+            z_ref = self.state.goal if self.state.goal is not None else home
 
             x_err = float(obs.x) - xy_ref.x
             y_err = float(obs.y) - xy_ref.y
-            z_err = float(obs.z) - home.z
+            z_err = float(obs.z) - z_ref.z
 
             vx = float(obs.vx)
             vy = float(obs.vy)
@@ -257,9 +275,9 @@ class CTBRDroneRLAdapter:
             #   +pitch_rate -> world vy decreases, -pitch_rate -> vy increases
             # So roll regulates world X and pitch regulates world Y here.
             # ------------------------------------------------------------
-            kp_pos_xy = 0.025
-            kd_vel_xy = 0.100
-            max_tilt_cmd = 0.16
+            kp_pos_xy = self.action_limits.goal_xy_pos_gain
+            kd_vel_xy = self.action_limits.xy_velocity_damping_gain
+            max_tilt_cmd = self.action_limits.xy_max_tilt_cmd
             goal_feedback_scale = self.action_limits.goal_feedback_scale
             if goal_feedback_scale is None:
                 goal_feedback_scale = self.action_limits.pd_feedback_scale
@@ -295,7 +313,7 @@ class CTBRDroneRLAdapter:
             )
 
             # ------------------------------------------------------------
-            # 3) 策略只作为小残差，先不要让 MAPPO 直接主导姿态
+            # 3) 策略作为小残差，先不要让 PPO/MAPPO 直接主导姿态和推力。
             # ------------------------------------------------------------
             residual_gain = self.action_limits.residual_gain
             attitude_feedback_scale = self.action_limits.attitude_feedback_scale
@@ -303,15 +321,17 @@ class CTBRDroneRLAdapter:
             pitch = attitude_feedback_scale * pitch_fb + residual_gain * pol_pitch
             roll = attitude_feedback_scale * roll_fb + residual_gain * pol_roll
             yaw = 0.0
-            thrust = self.action_limits.hover_thrust
+            thrust_residual = residual_gain * (pol_thrust - self.action_limits.hover_thrust)
+            thrust = self.action_limits.hover_thrust + thrust_residual
 
             # ------------------------------------------------------------
-            # 4) Z 保护
+            # 4) Z 低层控制：有目标点时追踪 goal.z，否则回到 home.z。
             # ------------------------------------------------------------
-            kp_z = 0.030
-            kd_z = 0.012
+            z_feedback_scale = self.action_limits.z_feedback_scale
+            kp_z = self.action_limits.z_pos_gain
+            kd_z = self.action_limits.z_vel_gain
 
-            thrust += kp_z * z_err + kd_z * vz
+            thrust += z_feedback_scale * (kp_z * z_err + kd_z * vz)
 
             roll = clamp(roll, -self.action_limits.max_roll_rate, self.action_limits.max_roll_rate)
             pitch = clamp(pitch, -self.action_limits.max_pitch_rate, self.action_limits.max_pitch_rate)
