@@ -707,6 +707,174 @@ class CTBRController:
                 0.0, 0.0,
             )
 
+    @staticmethod
+    def _wrap_angle_pi(angle: float) -> float:
+        """Wrap an angle in radians to [-pi, pi]."""
+        return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
+
+    def send_position_yaw_setpoint(self, x=0.0, y=0.0, z=-10.0, yaw=0.0):
+        """
+        发送 local NED 位置 + yaw setpoint。
+
+        与 send_hover_setpoint() 分开，避免改变已有位置悬停调用的行为。
+        yaw 单位为弧度，使用 MAVLink/PX4 的 NED yaw 约定。
+        """
+        type_mask = (
+            mavutil.mavlink.POSITION_TARGET_TYPEMASK_VX_IGNORE
+            | mavutil.mavlink.POSITION_TARGET_TYPEMASK_VY_IGNORE
+            | mavutil.mavlink.POSITION_TARGET_TYPEMASK_VZ_IGNORE
+            | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE
+            | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE
+            | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
+            | mavutil.mavlink.POSITION_TARGET_TYPEMASK_FORCE_SET
+            | mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
+        )
+
+        with self._send_lock:
+            self.master.mav.set_position_target_local_ned_send(
+                0,
+                self.master.target_system,
+                self.master.target_component,
+                mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+                type_mask,
+                float(x), float(y), float(z),
+                0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0,
+                self._wrap_angle_pi(yaw), 0.0,
+            )
+
+    def yaw_turn_in_place(
+        self,
+        angle_deg: float = 360.0,
+        yaw_rate_deg_s: float = 30.0,
+        timeout: float = None,
+        hold_after_sec: float = 0.5,
+        frequency: float = 20.0,
+        use_sim_time: bool = True,
+        wait_for_data_timeout: float = 3.0,
+    ) -> bool:
+        """
+        在当前位置原地旋转指定角度。
+
+        使用 OFFBOARD local NED 位置+yaw setpoint，保持当前位置 x/y/z 不变，
+        逐步改变 yaw。angle_deg 可为正/负，正值按 PX4 NED yaw 正方向旋转。
+        """
+        if not self.data_sync or not self.is_monitoring:
+            logger.error("原地转向失败：请先启动数据监听 start_monitoring()")
+            return False
+
+        angle_deg = float(angle_deg)
+        yaw_rate_deg_s = abs(float(yaw_rate_deg_s))
+        frequency = max(float(frequency), 1.0)
+
+        if abs(angle_deg) <= 1e-6:
+            logger.info("原地转向角度为 0，跳过")
+            return True
+        if yaw_rate_deg_s <= 1e-6:
+            logger.error(f"原地转向失败：非法 yaw_rate_deg_s={yaw_rate_deg_s}")
+            return False
+
+        if self.is_sending:
+            logger.info("原地转向前停止 CTBR 发送线程")
+            self.stop_ctbr_send_thread()
+        if self.is_offboard_running:
+            logger.info("原地转向前停止 OFFBOARD 位置保活任务")
+            self.stop_offboard_maintain()
+
+        start_wait = time.time()
+        obs = self.data_sync.get_latest_observation()
+        while obs.time_boot_ms <= 0 and time.time() - start_wait < wait_for_data_timeout:
+            time.sleep(0.05)
+            obs = self.data_sync.get_latest_observation()
+
+        if obs.time_boot_ms <= 0:
+            logger.error("原地转向失败：未收到有效 LOCAL/ATTITUDE 数据")
+            return False
+
+        hold_x, hold_y, hold_z = float(obs.x), float(obs.y), float(obs.z)
+        start_yaw = float(obs.yaw)
+
+        ok_mode = self.change_control_mode(
+            mode=6,
+            is_maintain_offboard=False,
+            default_x=hold_x,
+            default_y=hold_y,
+            default_z=hold_z,
+            wait_for_data_timeout=0.5,
+        )
+        if not ok_mode:
+            logger.error("原地转向失败：无法切换到 OFFBOARD")
+            return False
+
+        total_angle_rad = math.radians(angle_deg)
+        yaw_rate_rad_s = math.radians(yaw_rate_deg_s)
+        duration_sec = abs(total_angle_rad) / yaw_rate_rad_s
+        timeout_sec = float(timeout) if timeout is not None else duration_sec + 5.0
+        period_sec = 1.0 / frequency
+
+        logger.info(
+            "开始原地转向: "
+            f"angle={angle_deg:.1f}deg, yaw_rate={yaw_rate_deg_s:.1f}deg/s, "
+            f"hold=({hold_x:.2f}, {hold_y:.2f}, {hold_z:.2f}), "
+            f"start_yaw={math.degrees(start_yaw):.1f}deg"
+        )
+
+        time_keeper = None
+        if use_sim_time:
+            time_keeper = self._sim_time_keeper_or_none()
+
+        if time_keeper is not None:
+            start_ms = time_keeper.now_ms()
+            timeout_ms = int(timeout_sec * 1000)
+
+            def elapsed_sec():
+                return max(0.0, (time_keeper.now_ms() - start_ms) / 1000.0)
+
+            def timed_out():
+                return time_keeper.now_ms() - start_ms > timeout_ms
+
+            def wait_period():
+                ok = time_keeper.wait(period_sec, timeout=max(1.0, period_sec * 10.0))
+                if not ok:
+                    time.sleep(min(period_sec, 0.05))
+        else:
+            start_wall = time.time()
+
+            def elapsed_sec():
+                return max(0.0, time.time() - start_wall)
+
+            def timed_out():
+                return time.time() - start_wall > timeout_sec
+
+            def wait_period():
+                time.sleep(period_sec)
+
+        completed = False
+        while not timed_out():
+            elapsed = elapsed_sec()
+            progress = min(elapsed / duration_sec, 1.0)
+            target_yaw = start_yaw + total_angle_rad * progress
+            self.send_position_yaw_setpoint(hold_x, hold_y, hold_z, target_yaw)
+
+            if progress >= 1.0:
+                completed = True
+                break
+
+            wait_period()
+
+        if not completed:
+            logger.error(f"原地转向超时: timeout={timeout_sec:.1f}s")
+            return False
+
+        final_yaw = start_yaw + total_angle_rad
+        hold_deadline = time.time() + max(float(hold_after_sec), 0.0)
+        while time.time() < hold_deadline:
+            self.send_position_yaw_setpoint(hold_x, hold_y, hold_z, final_yaw)
+            time.sleep(period_sec)
+
+        logger.info("原地转向完成")
+        return True
+
     def change_control_mode(
         self,
         mode=6,
