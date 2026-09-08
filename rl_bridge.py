@@ -52,6 +52,8 @@ class CTBRActionLimits:
     max_roll_rate: float = 0.04
     max_pitch_rate: float = 0.04
     max_yaw_rate: float = 0.03
+    yaw_hold_kp: float = 1.0
+    yaw_hold_max_rate: float = math.radians(15.0)
     hover_thrust: float = 0.575
     thrust_delta: float = 0.015
     thrust_min: float = 0.55
@@ -108,10 +110,32 @@ class DroneRLState:
     prev_action: np.ndarray = field(default_factory=lambda: np.zeros(4, dtype=np.float32))
     last_goal_distance: Optional[float] = None
     last_px4_time_boot_ms: int = 0
+    policy_yaw_reference: Optional[float] = None
+    yaw_target: Optional[float] = None
 
 
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, float(value)))
+
+
+def wrap_angle_pi(angle: float) -> float:
+    """Wrap an angle in radians to [-pi, pi]."""
+    return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def rotate_world_xy_to_policy_frame(
+    x: float,
+    y: float,
+    current_yaw: float,
+    reference_yaw: Optional[float],
+) -> Tuple[float, float]:
+    """Rotate a world-NED XY vector into the policy's reference-heading frame."""
+    if reference_yaw is None:
+        return float(x), float(y)
+    delta_yaw = wrap_angle_pi(float(current_yaw) - float(reference_yaw))
+    c = math.cos(delta_yaw)
+    s = math.sin(delta_yaw)
+    return c * float(x) + s * float(y), -s * float(x) + c * float(y)
 
 
 def map_policy_action_to_ctbr(
@@ -143,6 +167,7 @@ def observation_vector(
     other: ObservationData,
     goal: GoalPoint,
     prev_action: np.ndarray,
+    yaw_reference: Optional[float] = None,
 ) -> np.ndarray:
     """
     Low-dimensional actor observation for one drone.
@@ -154,13 +179,25 @@ def observation_vector(
     # Fixed physical scaling keeps PPO/MAPPO inputs in a small, stable range
     # without depending on running statistics from one particular training run.
     own_pos = np.array([own.x, own.y, own.z], dtype=np.float32) / 10.0
-    own_vel = np.array([own.vx, own.vy, own.vz], dtype=np.float32) / 3.0
+    own_vx, own_vy = rotate_world_xy_to_policy_frame(
+        own.vx, own.vy, own.yaw, yaw_reference
+    )
+    own_vel = np.array([own_vx, own_vy, own.vz], dtype=np.float32) / 3.0
     own_att = np.array([own.roll, own.pitch, own.yaw], dtype=np.float32) / math.pi
     own_rates = np.array([own.rollspeed, own.pitchspeed, own.yawspeed], dtype=np.float32) / 4.0
 
-    goal_rel = np.array([goal.x - own.x, goal.y - own.y, goal.z - own.z], dtype=np.float32) / 5.0
-    other_rel_pos = np.array([other.x - own.x, other.y - own.y, other.z - own.z], dtype=np.float32) / 5.0
-    other_rel_vel = np.array([other.vx - own.vx, other.vy - own.vy, other.vz - own.vz], dtype=np.float32) / 3.0
+    goal_dx, goal_dy = rotate_world_xy_to_policy_frame(
+        goal.x - own.x, goal.y - own.y, own.yaw, yaw_reference
+    )
+    other_dx, other_dy = rotate_world_xy_to_policy_frame(
+        other.x - own.x, other.y - own.y, own.yaw, yaw_reference
+    )
+    other_dvx, other_dvy = rotate_world_xy_to_policy_frame(
+        other.vx - own.vx, other.vy - own.vy, own.yaw, yaw_reference
+    )
+    goal_rel = np.array([goal_dx, goal_dy, goal.z - own.z], dtype=np.float32) / 5.0
+    other_rel_pos = np.array([other_dx, other_dy, other.z - own.z], dtype=np.float32) / 5.0
+    other_rel_vel = np.array([other_dvx, other_dvy, other.vz - own.vz], dtype=np.float32) / 3.0
     prev = prev_action.astype(np.float32).copy()
     if prev.shape == (4,):
         prev = np.array([
@@ -230,6 +267,12 @@ class CTBRDroneRLAdapter:
         )
         self.state.prev_action = np.zeros(4, dtype=np.float32)
 
+    def set_policy_yaw_reference(self, yaw: float) -> None:
+        self.state.policy_yaw_reference = wrap_angle_pi(yaw)
+
+    def set_yaw_target(self, yaw: Optional[float]) -> None:
+        self.state.yaw_target = None if yaw is None else wrap_angle_pi(yaw)
+
     # def apply_policy_action(self, action: Sequence[float]) -> Tuple[float, float, float, float]:
     #     roll, pitch, yaw, thrust = map_policy_action_to_ctbr(action, self.action_limits)
     #     self.controller.update_ctbr_send_params(
@@ -260,8 +303,18 @@ class CTBRDroneRLAdapter:
             y_err = float(obs.y) - xy_ref.y
             z_err = float(obs.z) - z_ref.z
 
-            vx = float(obs.vx)
-            vy = float(obs.vy)
+            x_err, y_err = rotate_world_xy_to_policy_frame(
+                x_err,
+                y_err,
+                obs.yaw,
+                self.state.policy_yaw_reference,
+            )
+            vx, vy = rotate_world_xy_to_policy_frame(
+                obs.vx,
+                obs.vy,
+                obs.yaw,
+                self.state.policy_yaw_reference,
+            )
             vz = float(obs.vz)
 
             # ------------------------------------------------------------
@@ -320,7 +373,15 @@ class CTBRDroneRLAdapter:
 
             pitch = attitude_feedback_scale * pitch_fb + residual_gain * pol_pitch
             roll = attitude_feedback_scale * roll_fb + residual_gain * pol_roll
-            yaw = 0.0
+            if self.state.yaw_target is None or self.action_limits.yaw_hold_kp <= 0.0:
+                yaw = 0.0
+            else:
+                yaw_error = wrap_angle_pi(self.state.yaw_target - float(obs.yaw))
+                yaw = clamp(
+                    self.action_limits.yaw_hold_kp * yaw_error,
+                    -self.action_limits.yaw_hold_max_rate,
+                    self.action_limits.yaw_hold_max_rate,
+                )
             thrust_residual = residual_gain * (pol_thrust - self.action_limits.hover_thrust)
             thrust = self.action_limits.hover_thrust + thrust_residual
 

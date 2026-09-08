@@ -415,6 +415,12 @@ class CTBRController:
             return True
 
         logger.error("❌ 解锁 ACK 已接受，但 HEARTBEAT 未显示 armed")
+        heartbeat_age = time.time() - self._last_recv_wall_time if self._last_recv_wall_time > 0.0 else None
+        logger.error(
+            "HEARTBEAT 状态: "
+            f"armed={self._armed}, base_mode={self._base_mode}, custom_mode={self._custom_mode}, "
+            f"last_age={heartbeat_age if heartbeat_age is not None else 'never'}"
+        )
         logger.error(f"最近 PX4 STATUSTEXT: {self._recent_status_text()}")
         return False
 
@@ -613,7 +619,8 @@ class CTBRController:
                 logger.warning("SimTimeKeeper 不可用，将回退到系统时间")
                 time_keeper = None
 
-        if not self.arm_drone(timeout=5, use_sim_time=use_sim_time):
+        arm_timeout = min(20.0, max(10.0, float(timeout) * 0.5))
+        if not self.arm_drone(timeout=arm_timeout, use_sim_time=use_sim_time):
             logger.error("起飞失败：电机解锁失败")
             return False
 
@@ -1243,7 +1250,9 @@ class CTBRController:
     def start_monitoring(self, message_ids=None, freq_hz=20):
         """启动数据监听线程。"""
         if message_ids is None:
-            message_ids = [30, 375, 32, 33]  # ATTITUDE, ACTUATOR_OUTPUT_STATUS, LOCAL_POSITION_NED, GLOBAL_POSITION_INT
+            # HEARTBEAT keeps armed/mode state fresh; the remaining streams are
+            # ATTITUDE, ACTUATOR_OUTPUT_STATUS, LOCAL_POSITION_NED, GLOBAL_POSITION_INT.
+            message_ids = [0, 30, 375, 32, 33]
 
         if not self.is_monitoring:
             for msg_id in message_ids:
